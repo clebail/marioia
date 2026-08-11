@@ -17,7 +17,7 @@ void yyerror(const char *);
     ;
 }
 
-;.* {
+;[^\r\n]* {
     mapComment(yylineno, yytext);
 }
 

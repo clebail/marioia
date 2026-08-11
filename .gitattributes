@@ -1,0 +1,12 @@
+# Sources C++ : toujours stockées et extraites en LF.
+#
+# Les quatre fichiers de source/SMB/ listés ci-dessous sont réécrits par
+# codegen/ à chaque build. Les figer en LF garantit qu'un rebuild ne produit
+# jamais un diff qui ne serait que du changement de fin de ligne.
+*.cpp text eol=lf
+*.hpp text eol=lf
+
+# Désassemblage upstream, conservé octet pour octet tel que forké (CRLF).
+# Ne jamais normaliser : ce fichier est l'entrée de codegen et la base de la
+# relation de fork avec SuperMarioBros-C.
+docs/smbdis.asm -text
