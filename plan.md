@@ -50,7 +50,65 @@ Rien de plus.
 
 **Simulateur d'entraînement** : fork de SuperMarioBros-C, en headless
 (`update()` sans `render()`), quelques milliers de frames par seconde,
-un moteur par cœur.
+un moteur par cœur. `render(uint32_t*)` écrit un 256x240 ARGB dans un buffer
+fourni, sans passer par SDL : l'observation du simulateur est un `memcpy`, pas
+une capture.
+
+**Save states** : tout l'état est en champs membres plats, donc save/restore par
+`memcpy`. Deux tailles, à ne pas confondre :
+- recherche seule, qui ne rend rien : `ram[0x800]` + registres +
+  `returnIndexStack[100]`, soit ~2,5 Ko ;
+- restore *puis* rendu, ce qu'exige DAgger : il faut en plus l'état PPU
+  (`nametable[2048]`, `oam[256]`, `palette[32]`, registres), soit ~4,8 Ko.
+Le budget mémoire de la recherche double donc si l'on veut pouvoir rendre depuis
+n'importe quel nœud. Un save state n'est cohérent qu'en frontière de frame : le
+`returnIndexStack` et le dispatch par `goto` du code transpilé interdisent une
+sauvegarde en milieu de frame.
+
+**Objectif de victoire** : les 32 niveaux, de 1-1 à 8-4, sans zone de warp, avec
+un réseau généraliste unique. Décision du 12 août 2026. C'est la cible la plus
+exigeante des options envisagées, assumée comme telle : le repli documenté plus
+bas est admis si la généralisation bloque.
+
+**Solveur** : deux étages, dont un seul est déployé.
+
+1. *Oracle de recherche*, dans le simulateur. Best-first sur `(x, area)` — pas
+   sur x seul — avec frameskip 4 et jeu d'actions réduit à 6-8 combinaisons.
+   Doit résoudre les 32 niveaux avant que la distillation ait un sens.
+2. *Réseau pixels vers action*, généraliste sur les 32 niveaux, seul déployé sur
+   la boîte noire. Entrée : pile de 4 frames pour donner la vitesse, que la
+   frame seule ne contient pas. La pile vit dans l'agent, pas dans l'interface.
+
+**Transfert : DAgger, pas distillation en un coup.** Une trajectoire gagnante ne
+visite qu'une séquence d'états ; un réseau entraîné dessus n'a jamais rien vu à
+côté du chemin et n'y revient jamais après le premier écart. Or l'écart est
+garanti par la gigue du déploiement. On fait donc rouler l'élève, on restaure le
+simulateur aux états qu'il a visités, on relance la recherche depuis ces états
+pour obtenir la bonne action, et on agrège. L'oracle reste donc disponible
+pendant tout l'entraînement, il ne produit pas un jeu de trajectoires en amont.
+
+**Injection de latence à l'entraînement.** Dans le simulateur `step()` est
+instantané ; sur le vrai montage il y a la capture plus le série, avec de la
+gigue, et SMB demande des sauts à la frame près au-dessus des trous. Une
+politique entraînée à latence nulle est accordée sur un monde qui n'existe pas.
+Une fois la distribution mesurée à l'étape 3, on l'injecte : action appliquée k
+frames plus tard, observation vieille de k' frames, gigue échantillonnée dans la
+distribution réelle. La mesure de l'étape 3 est un paramètre d'entraînement, pas
+un livrable décoratif.
+
+**Jumeau synchronisé : écarté.** Les deux moteurs étant déterministes, on
+pourrait faire tourner SMB-C en jumeau de Mesen, planifier dedans et n'utiliser
+la capture que pour vérifier la synchro — sans aucun réseau. Écarté parce que
+son mode d'échec est irrattrapable : à la première désynchronisation due à la
+gigue, le jumeau n'a aucun moyen de se réamorcer depuis les pixels. Une
+politique réactive est robuste au même incident par construction, puisqu'elle
+réobserve à chaque frame. C'est le meilleur argument en faveur de
+l'architecture retenue.
+
+**Repli admis** si la généralisation bloque, par ordre de préférence : plus de
+tours de DAgger ciblés sur les niveaux en échec, puis plus de capacité, puis en
+dernier recours une politique par niveau — qui gagne mais n'est presque que du
+rejeu appris.
 
 **Dépôt** : unique. `clebail/marioia` est le fork de SuperMarioBros-C et porte
 aussi l'interface, l'adaptateur Mesen, l'adaptateur simulateur et le solveur.
@@ -72,7 +130,12 @@ headless) aussi minimal que prévu à l'origine.
    backend : lancer Mesen sous Xvfb et vérifier qu'il tient 60 fps. Xvfb tombe
    sur du GL logiciel (llvmpipe) ; si la cadence ne suit pas, basculer sur
    Xorg+dummy avec le GPU réel. C'est le seul risque sérieux de l'approche X11.
-4. Adaptateur simulateur, puis solveur.
+4. Adaptateur simulateur, puis solveur, dans cet ordre :
+   a. Harnais de comparaison de pixels SMB-C / Mesen. Bloquant : le réseau
+      apprend sur les pixels de `PPU.cpp` et joue sur ceux de Mesen.
+   b. Oracle de recherche, jusqu'à résoudre les 32 niveaux.
+   c. Boucle DAgger avec injection de la latence mesurée à l'étape 3.
+   d. Évaluation sur la boîte noire.
 
 L'ordre compte : l'interface se conçoit contre le côté contraint, Mesen et la
 manette physique, qui imposent leurs conditions.
@@ -99,10 +162,13 @@ Copier le `settings.json` dans le dépôt une fois figé.
 
 ## À trancher
 
-- Approche du solveur. Piste évoquée, non tranchée : recherche dans le
-  simulateur (save states de moins de 3 Ko) pour produire des trajectoires
-  gagnantes, puis distillation supervisée vers un réseau pixels vers action,
-  qui seul est déployé sur la boîte noire.
+- Résolution et format d'entrée du réseau (niveaux de gris, sous-échantillonnage).
+  Dépend du harnais de comparaison de pixels : inutile de choisir avant de savoir
+  si SMB-C et Mesen sont identiques au pixel près.
+- Ensemencement des épisodes d'entraînement sur les 32 niveaux : save states
+  collectés en début de chaque niveau, ou écriture directe de `WorldNumber`
+  ($075f), `AreaNumber` ($0760) et `LevelNumber` ($075c). La seconde est plus
+  simple mais contourne des routines d'initialisation, donc à valider.
 
 ## Pièges connus
 
@@ -119,6 +185,21 @@ Copier le `settings.json` dans le dépôt une fois figé.
   manette Pico reste donc opérante sous Xvfb.
 - `XCompositeNameWindowPixmap` doit être rappelé si la fenêtre est redimensionnée,
   l'ancien pixmap devenant invalide.
+- Les châteaux-labyrinthes 4-4, 7-4 et 8-4 rebouclent sur le mauvais chemin. Une
+  heuristique gloutonne en x y tourne indéfiniment : chercher sur `(x, area)` et
+  détecter les boucles. Corollaire côté réseau : le bon chemin n'y est pas
+  déductible des pixels locaux, le généraliste devra les mémoriser. C'est admis.
+- Les niveaux aquatiques (2-2, 7-2) ont une physique et un usage du bouton A
+  entièrement différents. Ils doivent être représentés dans l'échantillonnage
+  d'entraînement, sous peine d'être les premiers à échouer.
+- Le prétraitement doit être rigoureusement identique entre simulateur et
+  déploiement. Ça rend la taille de fenêtre Mesen (voir plus haut) non plus
+  souhaitable mais obligatoire en facteur entier de 256x240 : un
+  sous-échantillonnage depuis une taille non entière introduit des artefacts de
+  rééchantillonnage qui n'existent pas dans le simulateur.
+- L'évaluation sur la boîte noire tourne en temps réel : une partie complète
+  coûte une quinzaine de minutes. L'essentiel de l'évaluation se fait dans le
+  simulateur, la boîte noire ne sert qu'à la validation périodique.
 - SuperMarioBros-C n'a aucun fichier de licence, donc tous droits réservés.
   C'est la relation de fork GitHub qui couvre la copie, il faut la conserver.
 - Le dépôt de base d'une PR se vérifie à la main, ou se fixe avec
